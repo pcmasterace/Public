@@ -1,0 +1,113 @@
+import requests
+import time
+import pandas as pd
+import os
+
+# === CONFIGURATION ===
+BASE_URL = "https://blockstream.info/api"
+OG_Wallet_ID = "bc1qa5wkgaew2dkv56kfvj49j0av5nml45x9ek9hz6"
+MAX_DEPTH = 2
+MAX_ASSOCIATIONS_PER_LEVEL = 5
+DELAY_BETWEEN_CALLS = 1
+
+visited_addresses = set()
+rows = []
+
+# === HELPER FUNCTIONS ===
+
+def get_address_txs(Wallet_ID):
+    url = f"{BASE_URL}/address/{Wallet_ID}/txs"
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise Exception(f"Error: {response.status_code} {response.text}")
+    return response.json()
+
+def get_tx_details(txid):
+    url = f"{BASE_URL}/tx/{txid}"
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise Exception(f"Error fetching tx {txid}: {response.status_code}")
+    return response.json()
+
+def sats_to_btc(sats):
+    return sats / 1e8
+
+def analyze_transactions(Wallet_ID, depth):
+    if Wallet_ID in visited_addresses:
+        return set()
+    visited_addresses.add(Wallet_ID)
+
+    indent = "  " * depth
+    print(f"{indent}Analyzing [{depth}-hop] address: {Wallet_ID}")
+
+    try:
+        txs = get_address_txs(Wallet_ID)
+    except Exception as e:
+        print(f"{indent}Failed to get txs: {e}")
+        return set()
+
+    associated_addresses = set()
+
+    for tx in txs:
+        txid = tx['txid']
+        try:
+            details = get_tx_details(txid)
+        except Exception as e:
+            print(f"{indent}  Failed to get tx {txid}: {e}")
+            continue
+
+        timestamp = details['status'].get('block_time', None)
+        date_str = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(timestamp)) if timestamp else "Unconfirmed"
+
+        for vin in details.get("vin", []):
+            prevout = vin.get('prevout', {})
+            assoc = prevout.get('scriptpubkey_address')
+            amount = prevout.get('value', 0)
+            if assoc and assoc != Wallet_ID:
+                associated_addresses.add(assoc)
+                rows.append({
+                    "Source Address": Wallet_ID,
+                    "Associated Address": assoc,
+                    "TxID": txid,
+                    "Timestamp": date_str,
+                    "Direction": "input",
+                    "Amount (BTC)": sats_to_btc(amount)
+                })
+
+        for vout in details.get("vout", []):
+            assoc = vout.get('scriptpubkey_address')
+            amount = vout.get('value', 0)
+            if assoc and assoc != Wallet_ID:
+                associated_addresses.add(assoc)
+                rows.append({
+                    "Source Address": Wallet_ID,
+                    "Associated Address": assoc,
+                    "TxID": txid,
+                    "Timestamp": date_str,
+                    "Direction": "output",
+                    "Amount (BTC)": sats_to_btc(amount)
+                })
+
+    return associated_addresses
+
+def recursive_analyze(Wallet_ID, depth=0, max_depth=2):
+    if depth > max_depth:
+        return
+
+    assoc = analyze_transactions(Wallet_ID, depth)
+
+    for addr in list(assoc)[:MAX_ASSOCIATIONS_PER_LEVEL]:
+        time.sleep(DELAY_BETWEEN_CALLS)
+        recursive_analyze(addr, depth + 1, max_depth)
+
+# === MAIN EXECUTION ===
+
+recursive_analyze(OG_Wallet_ID, depth=0, max_depth=MAX_DEPTH)
+
+df = pd.DataFrame(rows)
+print(df.head())
+
+
+# Optional: save to CSV
+output_file = "bitcoin_wallet_network.csv"
+df.to_csv(output_file, index=False)
